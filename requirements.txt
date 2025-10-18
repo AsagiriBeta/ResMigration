@@ -1,0 +1,4 @@
+# Pinned runtime dependencies for ResMigration and verify scripts
+# If you need stricter pinning, lock to exact versions known-good in your environment.
+nbtlib>=2.0.4
+PyYAML>=6.0.3
