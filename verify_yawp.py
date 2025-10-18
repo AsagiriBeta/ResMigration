@@ -10,10 +10,12 @@ Usage examples:
 import argparse
 import os
 import sys
+import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
 import nbtlib
 from nbtlib import Compound, List as NbtList
+from nbtlib.tag import IntArray
 
 
 def _is_dat_file(path: str) -> bool:
@@ -42,48 +44,105 @@ def _safe_unpack(tag: Any, default: Any = None) -> Any:
         return default
 
 
+def _first_player_name_from_owners(owners_tag: Any) -> Tuple[str, str]:
+    """Extract owner (name, uuid_str) from YAWP official owners structure: { players: [ {uuid:IntArray[4], name:'literal{...}'} ], teams: [] }"""
+    if not isinstance(owners_tag, Compound):
+        return '', ''
+    players = owners_tag.get('players')
+    if isinstance(players, NbtList) and len(players) > 0:
+        p = players[0]
+        if isinstance(p, Compound):
+            name_raw = _safe_unpack(p.get('name'), '')
+            # expected format literal{<name>}
+            name = str(name_raw)
+            if name.startswith('literal{') and name.endswith('}'):
+                name = name[len('literal{'):-1]
+            uuid_tag = p.get('uuid')
+            if isinstance(uuid_tag, IntArray) and len(uuid_tag) == 4:
+                # Convert to canonical UUID string
+                vals = [int(v) for v in uuid_tag]
+                # Rebuild 16 bytes from 4 signed ints (big-endian)
+                b = b''.join(int(v & 0xFFFFFFFF).to_bytes(4, 'big', signed=False) for v in vals)
+                try:
+                    u = uuid.UUID(bytes=b)  # type: ignore[name-defined]
+                    uuid_str = str(u)
+                except Exception:
+                    uuid_str = ''
+                return name, uuid_str
+            return name, ''
+    return '', ''
+
+
+essential_flag_subset = (
+    'build', 'break', 'interact', 'pvp', 'container', 'teleport', 'explosion', 'fire_spread'
+)
+
+
 def _extract_region_info(reg: Compound) -> Dict[str, Any]:
-    # Name
-    name = _safe_unpack(reg.get('name'), '')
-
-    # Owner
-    owner_tag = reg.get('owner', Compound())
-    owner_uuid = _safe_unpack(owner_tag.get('uuid'), '') if isinstance(owner_tag, Compound) else ''
-    owner_name = _safe_unpack(owner_tag.get('name'), '') if isinstance(owner_tag, Compound) else ''
-
-    # Bounding box
-    bbox_tag = reg.get('bounding_box', Compound())
-    bbox = {}
-    if isinstance(bbox_tag, Compound):
-        for k in ('x1', 'y1', 'z1', 'x2', 'y2', 'z2'):
-            if k in bbox_tag:
-                bbox[k] = _safe_unpack(bbox_tag[k])
-
-    # Flags
-    flags_tag = reg.get('flags', Compound())
-    flags = _safe_unpack(flags_tag, {}) if isinstance(flags_tag, Compound) else {}
-
-    # Player permissions
-    permissions_tag = reg.get('permissions', Compound())
-    players_dict: Dict[str, Dict[str, Any]] = {}
-    if isinstance(permissions_tag, Compound):
-        players_tag = permissions_tag.get('players', Compound())
-        if isinstance(players_tag, Compound):
-            for uuid, pf in players_tag.items():
-                players_dict[uuid] = _safe_unpack(pf, {})
-
-    # Meta
+    """Extract a summary from either:
+      - official YAWP MarkedRegion (has keys: area{p1,p2}, owners{players}, flags, name, dimension, ...)
+      - older intermediate format (has keys: bounding_box{x1..z2}, owner{uuid,name}, flags, messages, ...)
+    """
+    # Default values
+    name = ''
+    owner_name = ''
+    owner_uuid = ''
+    bbox = {'x1': None, 'y1': None, 'z1': None, 'x2': None, 'y2': None, 'z2': None}
+    flags: Dict[str, Any] = {}
+    players: Dict[str, Dict[str, Any]] = {}
     created = ''
-    meta_tag = reg.get('meta', Compound())
-    if isinstance(meta_tag, Compound) and 'created' in meta_tag:
-        created = _safe_unpack(meta_tag['created'], '')
-
-    # Messages
-    messages_tag = reg.get('messages', Compound())
     enter_msg = leave_msg = ''
-    if isinstance(messages_tag, Compound):
-        enter_msg = _safe_unpack(messages_tag.get('enter'), '')
-        leave_msg = _safe_unpack(messages_tag.get('leave'), '')
+
+    # Detect official shape by presence of 'area' and 'owners'
+    if isinstance(reg, Compound) and 'area' in reg and 'owners' in reg:
+        name = _safe_unpack(reg.get('name'), '')
+        owners_tag = reg.get('owners')
+        owner_name, owner_uuid = _first_player_name_from_owners(owners_tag)
+        # area -> bbox
+        area = reg.get('area', Compound())
+        if isinstance(area, Compound):
+            p1 = area.get('p1')
+            p2 = area.get('p2')
+            if isinstance(p1, IntArray) and isinstance(p2, IntArray) and len(p1) == 3 and len(p2) == 3:
+                x1, y1, z1 = map(int, list(p1))
+                x2, y2, z2 = map(int, list(p2))
+                bbox = {
+                    'x1': min(x1, x2), 'y1': min(y1, y2), 'z1': min(z1, z2),
+                    'x2': max(x1, x2), 'y2': max(y1, y2), 'z2': max(z1, z2)
+                }
+        flags_tag = reg.get('flags', Compound())
+        if isinstance(flags_tag, Compound):
+            # Convert to plain python values
+            flags = {str(k): bool(int(_safe_unpack(v, 0))) for k, v in flags_tag.items()}
+        # messages not available in official MarkedRegion -> keep empty
+    else:
+        # Fallback: older simplified format
+        name = _safe_unpack(reg.get('name'), '')
+        owner_tag = reg.get('owner', Compound())
+        if isinstance(owner_tag, Compound):
+            owner_uuid = _safe_unpack(owner_tag.get('uuid'), '')
+            owner_name = _safe_unpack(owner_tag.get('name'), '')
+        bbox_tag = reg.get('bounding_box', Compound())
+        if isinstance(bbox_tag, Compound):
+            for k in ('x1', 'y1', 'z1', 'x2', 'y2', 'z2'):
+                if k in bbox_tag:
+                    bbox[k] = _safe_unpack(bbox_tag[k])
+        flags_tag = reg.get('flags', Compound())
+        if isinstance(flags_tag, Compound):
+            flags = {str(k): bool(int(_safe_unpack(v, 0))) for k, v in flags_tag.items()}
+        permissions_tag = reg.get('permissions', Compound())
+        if isinstance(permissions_tag, Compound):
+            players_tag = permissions_tag.get('players', Compound())
+            if isinstance(players_tag, Compound):
+                for uuid_s, pf in players_tag.items():
+                    players[uuid_s] = {str(k): bool(int(_safe_unpack(v, 0))) for k, v in (pf or {}).items()} if isinstance(pf, Compound) else {}
+        meta_tag = reg.get('meta', Compound())
+        if isinstance(meta_tag, Compound) and 'created' in meta_tag:
+            created = _safe_unpack(meta_tag['created'], '')
+        messages_tag = reg.get('messages', Compound())
+        if isinstance(messages_tag, Compound):
+            enter_msg = _safe_unpack(messages_tag.get('enter'), '')
+            leave_msg = _safe_unpack(messages_tag.get('leave'), '')
 
     return {
         'name': name,
@@ -91,16 +150,11 @@ def _extract_region_info(reg: Compound) -> Dict[str, Any]:
         'owner_name': owner_name,
         'bbox': bbox,
         'flags': flags,
-        'players': players_dict,
-        'player_count': len(players_dict),
+        'players': players,
+        'player_count': len(players),
         'created': created,
         'messages': {'enter': enter_msg, 'leave': leave_msg},
     }
-
-
-essential_flag_subset = (
-    'build', 'break', 'interact', 'pvp', 'container', 'teleport', 'explosion', 'fire_spread'
-)
 
 
 def format_region_summary(idx: int, total: int, file_label: str, info: Dict[str, Any],
@@ -117,7 +171,8 @@ def format_region_summary(idx: int, total: int, file_label: str, info: Dict[str,
     header = f"[{idx}/{total}] {file_label} :: {name}"
     lines.append(header)
     lines.append(f"  owner     : {owner}")
-    lines.append(f"  created   : {created}")
+    if created:
+        lines.append(f"  created   : {created}")
     lines.append(f"  bbox      : {bbox_str}")
 
     # Flags summary
@@ -133,14 +188,14 @@ def format_region_summary(idx: int, total: int, file_label: str, info: Dict[str,
         all_flags_str = ', '.join(f"{k}={'1' if bool(v) else '0'}" for k, v in sorted(flags.items()))
         lines.append(f"    all     : {all_flags_str}")
 
-    # Players summary
-    lines.append(f"  players   : {len(players)} with custom flags")
+    # Players summary (only for older simplified format)
     if verbose and players:
+        lines.append(f"  players   : {len(players)} with custom flags")
         for puid, pfl in sorted(players.items()):
             pfl_str = ', '.join(f"{k}={'1' if bool(v) else '0'}" for k, v in sorted((pfl or {}).items()))
             lines.append(f"    - {puid}: {pfl_str}")
 
-    # Messages
+    # Messages (only for older simplified format)
     msg = info.get('messages') or {}
     if msg.get('enter') or msg.get('leave'):
         lines.append(f"  messages  : enter='{msg.get('enter','')}', leave='{msg.get('leave','')}'")
@@ -171,6 +226,35 @@ def _as_mapping(nbt_file: Any) -> Dict[str, Any]:
     return {}
 
 
+def _compound_items(obj: Any) -> Iterable[Tuple[str, Any]]:
+    return obj.items() if isinstance(obj, Compound) else []
+
+
+def _list_local_regions_from_post(root_map: Dict[str, Any]) -> List[Compound]:
+    # Expect root: { data: { local_regions: { name: Compound, ... } } }
+    data = root_map.get('data')
+    if isinstance(data, Compound):
+        local_regions = data.get('local_regions')
+        if isinstance(local_regions, Compound):
+            return [v for _, v in _compound_items(local_regions)]
+    return []
+
+
+def _list_regions_from_pre_combined(root_map: Dict[str, Any]) -> List[Compound]:
+    # Expect root: { data: { dimensions: { dimId: { regions: { name: Compound } } } } }
+    data = root_map.get('data')
+    out: List[Compound] = []
+    if isinstance(data, Compound):
+        dimensions = data.get('dimensions')
+        if isinstance(dimensions, Compound):
+            for _, dim_blob in _compound_items(dimensions):
+                if isinstance(dim_blob, Compound):
+                    regions = dim_blob.get('regions')
+                    if isinstance(regions, Compound):
+                        out.extend([v for _, v in _compound_items(regions)])
+    return out
+
+
 def load_regions_from_dat(dat_path: str) -> Tuple[List[Compound], str]:
     try:
         nbt_file = nbtlib.load(dat_path)
@@ -181,27 +265,33 @@ def load_regions_from_dat(dat_path: str) -> Tuple[List[Compound], str]:
     if not root_map:
         raise ValueError(f"Unexpected NBT structure in '{dat_path}' (empty or unsupported root)")
 
-    # Accept either wrapped in 'yawp' or direct 'regions' at root
+    # Post 1.21.5 per-dimension files (data.local_regions)
+    regs = _list_local_regions_from_post(root_map)
+    if regs:
+        return regs, os.path.basename(dat_path)
+
+    # Pre 1.21.5 combined file (data.dimensions.*.regions)
+    regs = _list_regions_from_pre_combined(root_map)
+    if regs:
+        return regs, os.path.basename(dat_path)
+
+    # Old intermediate format (regions list under root or under 'yawp')
     if 'yawp' in root_map:
         yawp = root_map['yawp']
-        # Some nbtlib variants keep Compound wrapper; treat it as mapping
-        if isinstance(yawp, Compound):
-            yawp_map = dict(yawp.items())
-        else:
-            yawp_map = getattr(yawp, 'items', lambda: [])()
-            yawp_map = dict(yawp_map) if yawp_map else {}
+        yawp_map = dict(yawp.items()) if isinstance(yawp, Compound) else {}
     else:
         yawp_map = root_map
-
     regions_tag = yawp_map.get('regions')
     if isinstance(regions_tag, NbtList):
         return list(regions_tag), os.path.basename(dat_path)
 
-    # Post 1.21.5 dimensions.dat: contains 'dimensions' list but no 'regions'
-    if 'dimensions' in yawp_map:
-        return [], os.path.basename(dat_path)
+    # dimensions.dat or global.dat: just skip; no regions
+    if isinstance(root_map.get('data'), Compound):
+        data = root_map['data']
+        if 'dims' in data or 'id' in data:
+            return [], os.path.basename(dat_path)
 
-    raise ValueError(f"Unexpected NBT structure in '{dat_path}' (no 'regions' list)")
+    raise ValueError(f"Unexpected NBT structure in '{dat_path}' (no regions found)")
 
 
 def main(argv: List[str]) -> int:
