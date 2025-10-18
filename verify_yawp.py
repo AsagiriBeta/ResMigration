@@ -194,10 +194,14 @@ def load_regions_from_dat(dat_path: str) -> Tuple[List[Compound], str]:
         yawp_map = root_map
 
     regions_tag = yawp_map.get('regions')
-    if not isinstance(regions_tag, NbtList):
-        raise ValueError(f"Unexpected NBT structure in '{dat_path}' (no 'regions' list)")
+    if isinstance(regions_tag, NbtList):
+        return list(regions_tag), os.path.basename(dat_path)
 
-    return list(regions_tag), os.path.basename(dat_path)
+    # Post 1.21.5 dimensions.dat: contains 'dimensions' list but no 'regions'
+    if 'dimensions' in yawp_map:
+        return [], os.path.basename(dat_path)
+
+    raise ValueError(f"Unexpected NBT structure in '{dat_path}' (no 'regions' list)")
 
 
 def main(argv: List[str]) -> int:
